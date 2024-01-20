@@ -1,0 +1,320 @@
+esphome:
+  name: ${devicename}
+  on_boot:
+    priority: -100.0
+    then:
+      - globals.set:
+          id: by_angle
+          value: '1'
+      - lambda: |-
+          ESP_LOGI("Initial", "by_angle: %d", id(by_angle));
+          ESP_LOGI("Initial", "ANGLE_SENSOR: pos_high: %.02f, pos_low: %.02f", id(pos_high), id(pos_low));
+          ESP_LOGI("Initial", "ROTARY_SENSOR: curr_step: %.02f, step_total: %.02f", id(curr_step), id(step_total));
+
+preferences:
+  flash_write_interval: 1min
+  
+esp8266:  
+  board: esp12e
+  restore_from_flash: true
+
+i2c:
+  - id: giro
+    sda: GPIO4
+    scl: GPIO5
+    scan: True
+    
+globals:
+  - id: by_angle
+    type: bool
+    initial_value: 'true'
+    restore_value: yes
+    
+  - id: pos_low    
+    type: float
+    initial_value: '-8'
+    restore_value: yes
+    
+  - id: pos_high    
+    type: float
+    initial_value: '10'
+    restore_value: yes
+    
+  - id: step_total
+    type: float
+    restore_value: yes
+    initial_value: '10'
+
+  - id: r_pos
+    type: float
+    restore_value: no
+    initial_value: '0'
+    
+  - id: curr_step
+    type: float
+    restore_value: no
+    initial_value: '5'
+
+  - id: step_count
+    type: float
+    restore_value: no
+    initial_value: '0'
+
+  - id: curr_tilt
+    type: float
+    restore_value: no
+    initial_value: '0.00' 
+    
+  - id: calibrate
+    type: int
+    initial_value: '0'
+    restore_value: no  
+    
+sensor:
+  - platform: adc
+    id: rotary_sensor
+    pin: A0
+    update_interval: 10s
+    filters:
+      - lambda: |-
+          x = round(x*10)/10.0;
+          
+          if (id(r_pos) != x) {
+            if (id(cw).state) {
+              id(curr_step) += 1;
+              
+              if (id(calibrate) == 2) {
+                id(step_count) += 1;
+              }              
+            } else if (id(ccw).state) { 
+              id(curr_step) -= 1;
+              
+              if (id(calibrate) == 2) {
+                id(step_count) -= 1;
+              }                            
+            }
+          }
+          
+          if (id(curr_step) > id(step_total)) { id(curr_step) = id(step_total); }
+          else if (id(curr_step) < 0) { id(curr_step) = 0; }
+          
+          id(r_pos) = x;
+
+          ESP_LOGI("main", "curr_step: %.02f", id(curr_step) / id(step_total));
+
+          return id(curr_step) / id(step_total);  
+  
+  - platform: mpu6050
+    address: 0x68
+    id: gyro
+    update_interval: 10s
+    accel_x:
+      id: acc_x
+      filters:
+        - lambda: |-
+            x = round(x*10)/10.0;
+
+            float sens_side = (id(pos_low) > id(pos_high)); /* sensor side: 0 - left, 1 - right */
+            
+            if (id(calibrate) == 0) {
+              if (sens_side) {
+                if (x > id(pos_low)) { return 0.0; }
+                if (x < id(pos_high)) { return 1.0; }  
+
+                x = 1 - round((x - id(pos_high)) / (id(pos_low) - id(pos_high)) * 100) / 100.0;                
+  
+              } else {
+                if (x < id(pos_low)) { return 0.0; }
+                if (x > id(pos_high)) { return 1.0; }                      
+                
+                x = round((x - id(pos_low)) / (id(pos_high) - id(pos_low)) * 100) / 100.0;
+              }
+
+              id(curr_step) = round(x * id(step_total));
+            }            
+
+            ESP_LOGI("main", "x: %f, pos_low: %f, pos_high: %f, sens_side: %f, curr_step: %f, step_total: %f", x, id(pos_low), id(pos_high), sens_side, id(curr_step), id(step_total));
+
+            return x;
+
+  - platform: template
+    name: ${devicename} Calibrate Step
+    id: calibrate_step
+    lambda: |-
+      return id(calibrate);
+
+text_sensor:
+  - platform: template
+    name: ${devicename} Calibrate Message
+    id: calibrate_msg
+
+switch:
+  - platform: gpio
+    pin: ${pin_ccw}
+    id: ccw
+    interlock: [cw]
+  
+  - platform: gpio
+    pin: ${pin_cw}
+    id: cw
+    interlock: [ccw]    
+
+  - platform: template
+    name: ${devicename} Use Angle Sensor
+    lambda: |-
+        return id(by_angle); 
+
+    turn_on_action:
+      - globals.set:
+          id: by_angle
+          value: 'true'        
+
+    turn_off_action:
+      - globals.set:      
+          id: by_angle
+          value: 'false'        
+    
+button:
+  - platform: template  
+    name: ${devicename} Calibrate
+    icon: 'mdi:tune-vertical'
+    on_press:
+      lambda: |-
+        if (id(calibrate) == 0) {
+          id(calibrate)++;
+
+          ESP_LOGI("main", "Calibrating, 1st step.");
+          ESP_LOGI("main", "Please press DOWN, and then press stop button, when tilts fully closed");          
+          id(calibrate_msg).publish_state("Please press DOWN button, and then press STOP button, when tilts fully closed");
+          
+        } else if (id(calibrate) == 1) {
+          id(pos_low) = id(acc_x).state;
+          id(step_count) = 0;
+          id(calibrate)++;
+          
+          ESP_LOGI("main", "Calibrating, 2nd step.");
+          ESP_LOGI("main", "Please press UP button, and then press stop button, when tilts fully closed");            
+          id(calibrate_msg).publish_state("Please press UP button, and then press STOP button, when tilts fully closed");
+
+        } else if (id(calibrate) == 2) {
+          id(pos_high) = id(acc_x).state;
+          id(step_total) = int(id(step_count));
+          id(calibrate) = 0;
+
+          ESP_LOGI("main", "Lower limit set to %f", id(pos_low));
+          ESP_LOGI("main", "Upper limit set to %f", id(pos_high));
+          ESP_LOGI("main", "Motor total steps set to %f", id(step_total));
+          ESP_LOGI("main", "Calibrating finished.");          
+          
+          id(calibrate_msg).publish_state("Calibrating finished");
+        }
+        
+        id(calibrate_step).update();
+
+interval: 
+  - interval: 0.1s
+    then:
+      - if:
+          condition: 
+            - lambda: 'return (id(cw).state || id(ccw).state);'
+          then:
+            - component.update: rotary_sensor
+            - component.update: gyro
+
+cover:
+  - platform: template
+    device_class: blind
+    id: mycover
+    name: ${devicename}
+    has_position: true
+
+    lambda: |-
+      float sens = (id(by_angle) ? id(acc_x).state : id(rotary_sensor).state);    
+
+      if (id(calibrate) == 0) {
+        return round(sens * 2) / 2.0;
+      } else {
+        return 0.5;
+      }
+
+    tilt_lambda: |- 
+      float sens = (id(by_angle) ? id(acc_x).state : id(rotary_sensor).state);
+
+      if (id(calibrate) == 0) {
+          if (
+            (id(cw).state && sens >= id(curr_tilt)) ||
+            (id(ccw).state && sens <= id(curr_tilt))
+          ) {
+            auto call = id(mycover).make_call();
+            call.set_command_stop();
+            call.perform();
+          } 
+          
+          return round(sens * 2) / 2.0;
+        
+      }  else { 
+        return 0.5;
+      }
+
+    tilt_action:
+      - lambda: |-
+          if (id(curr_tilt) < tilt) {
+              id(curr_tilt) = tilt;
+              id(cw).turn_on();
+            
+          } else if (id(curr_tilt) > tilt) {
+              id(curr_tilt) = tilt;
+              id(ccw).turn_on();
+          }
+        
+    open_action:
+      - lambda: |-    
+          if (id(curr_tilt) >= 0.5 && id(curr_tilt) < 1.0) { 
+            id(curr_tilt) = 1.0;
+          } else {
+            id(curr_tilt) = 0.5;
+          }
+          
+          id(mycover).current_operation = COVER_OPERATION_OPENING;
+          id(mycover).publish_state();     
+          
+          id(cw).turn_on();                  
+
+    close_action:
+      - lambda: |-    
+          if (id(curr_tilt) > 0.0 && id(curr_tilt) <= 0.5) { 
+            id(curr_tilt) = 0.0;
+          } else {
+            id(curr_tilt) = 0.5;
+          }
+          
+          id(mycover).current_operation = COVER_OPERATION_CLOSING;
+          id(mycover).publish_state();     
+
+          id(ccw).turn_on();          
+
+    stop_action:
+      - switch.turn_off: cw
+      - switch.turn_off: ccw
+      - lambda: |-
+          id(mycover).current_operation = COVER_OPERATION_IDLE;
+          id(mycover).publish_state();      
+
+
+script:
+  - id: rotary_update
+    mode: restart
+    parameters:
+      delay_ms: int    
+    then:
+      - lambda: |-
+                auto that = id(rotary_sensor);
+                App.scheduler.cancel_interval(that, "update");
+                that->set_update_interval(delay_ms);
+                App.scheduler.set_interval(that, "update", that->get_update_interval(), std::move([that]() { that->update(); }));        
+      
+      - lambda: |-                
+                auto that = id(gyro);
+                App.scheduler.cancel_interval(that, "update");
+                that->set_update_interval(delay_ms);
+                App.scheduler.set_interval(that, "update", that->get_update_interval(), std::move([that]() { that->update(); }));        
